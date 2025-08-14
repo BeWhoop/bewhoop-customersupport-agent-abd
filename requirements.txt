@@ -1,0 +1,8 @@
+langchain
+langchain-community
+supabase
+python-dotenv
+langchain-openai
+transformers 
+sentence-transformers
+langchain_huggingface
