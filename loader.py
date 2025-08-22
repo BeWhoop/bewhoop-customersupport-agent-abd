@@ -24,7 +24,7 @@ def store_documents():
     embedding_model = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-mpnet-base-v2", 
         model_kwargs={'device': 'cpu'},  # Use 'cuda' if you have GPU
-        encode_kwargs={'normalize_embeddings': False}
+        encode_kwargs={'normalize_embeddings': True}
     )
 
     # Store documents with embeddings
