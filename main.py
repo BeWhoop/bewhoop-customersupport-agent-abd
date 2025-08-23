@@ -1,30 +1,13 @@
-from langchain_community.vectorstores import SupabaseVectorStore
-from db import supabase_client
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from core import tools, create_support_ticket
 import os
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain.agents import tool, AgentExecutor, create_tool_calling_agent
 
 load_dotenv()
 
-# Embeddings
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-mpnet-base-v2",
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True}
-)
-
-# Vector store
-vector_store = SupabaseVectorStore(
-    embedding=embeddings,
-    client=supabase_client,
-    table_name="documents",
-    query_name="match_documents",
-)
-
-# LLM
+# LLM for the agent
 llm = ChatOpenAI(
     model_name="openai/gpt-3.5-turbo",
     base_url="https://openrouter.ai/api/v1",
@@ -33,82 +16,74 @@ llm = ChatOpenAI(
     max_tokens=500,
 )
 
-def semantic_memory_lookup(query:str, threshold:float = 0.82):
-    query_vec = embeddings.embed_query(query)
-    response = supabase_client.rpc(
-        "match_qa_memory",
-        {"query_embedding": query_vec, "match_threshold": threshold, "match_count": 1}
-    ).execute()
-    data = getattr(response, "data", None) or []
-    return data[0] if data else None
-
-def semantic_memory_upsert(question: str, answer: str):
-    # Converting Query to vectors
-    q_vec = embeddings.embed_query(question)
-    # Making payload as json, because upsert accepts json
-    payload = {"question" : question, "answer" : answer, "q_embedding" : q_vec}
-    # Uploading Q/A to qa_memory table with question as a unique value
-    supabase_client.table("qa_memory").upsert(payload, on_conflict="question").execute()
-    
-# ------- TOOLS -------
-@tool
-def search_memory(query: str) -> str:
-    """Search for previously answered questions in semantic memory. Use this first to check if the question has been answered before."""
-    
-    res = semantic_memory_lookup(query)
-    if res and len(res['answer'].strip()) > 20 and not res['answer'].strip().lower().startswith("i don't know"):
-        return f"Found in memory: {res['answer']}"
-    
-    return "No relevant answer found in memory."
-
-@tool
-def search_knowledge_base(query: str) -> str:
-    """Search the knowledge base using RAG and store the result in memory for future use. Use this when memory search returns no results."""
-    
-    relevant_docs = vector_store.similarity_search(query, k=3)
-    if not relevant_docs:
-        return "No relevant information found in the knowledge base."
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful assistant for BeWhoop services. Answer questions related to account creation, vendor information, events, etc. Be concise where you can be"),
-        ("human", "Question: {question} \n Knowledge Base: {context} \n Please answer the user's question based on the above context.")
-    ])
-    
-    chain = prompt | llm
-    response = chain.invoke({"context": relevant_docs, "question": query})
-    answer = response.content
-    
-    if answer.strip() and not answer.strip().lower().startswith("i don't know"):
-        # Store the new Q&A in memory for future use
-        semantic_memory_upsert(query, answer)
-        return answer
-    
-    return "Sorry, I couldn't find relevant information in the knowledge base."
-
-
-tools = [search_memory, search_knowledge_base]
-
-# Agent
+# Agent prompt
 prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are BeWhoop's support AI assistant. You have access to two {tools}:
+    ("system", """You are BeWhoop's Support AI assistant. You help customers with questions about our services.
 
-Workflow:
-- Always start with search_memory
-- If memory search finds a relevant answer, return it directly
-- If memory search finds no results, then use search_knowledge_base
-- Return the answer from whichever tool provides useful information
-- Be helpful and concise in your responses"""),
+Your workflow:
+1. ALWAYS start with search_memory to check for previously answered questions
+2. If memory search finds a relevant answer, return it directly to the user
+3. If no memory result, use search_knowledge_base to search the knowledge base
+4. If knowledge base returns a clear answer, provide it to the user - DO NOT ask for escalation
+5. If knowledge base returns "NO_ANSWER_FOUND_IN_KB", you MUST say: "I couldn't find an answer to your question. I will need to escalate this to our support team. Could you please provide your contact number and email address for further assistance?"
+
+Critical Rules:
+- When you see "NO_ANSWER_FOUND_IN_KB", do NOT ask for more context - escalate immediately
+- If you find relevant information in the knowledge base, provide it without asking for escalation
+- Never hallucinate or invent information
+- Be professional and concise"""),
     ("user", "{input}"),
     ("placeholder", "{agent_scratchpad}")
 ])
 
+# Create agent
 agent = create_tool_calling_agent(llm, tools, prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
-if __name__ == "__main__":
+def handle_escalation(question):
+    """Handle the escalation process by collecting contact info"""
+    print("\n--- Escalation Process ---")
+    contact_number = input("Please enter your contact number: ").strip()
+    email_address = input("Please enter your email address: ").strip()
+    
+    if contact_number and email_address:
+        result = create_support_ticket(question, contact_number, email_address)
+        print(f"\nBeWhoop Assistant: {result}")
+        return True
+    else:
+        print("\nBeWhoop Assistant: Both contact number and email are required for escalation. Please try again.")
+        return False
+
+def main():
+    print("BeWhoop Support Assistant")
+    print("Type 'exit' to quit")
+    print("-" * 30)
+    
     while True:
-        question = input("Ask a question: ").strip()
+        question = input("\nAsk a question: ").strip()
         if question.lower() == "exit":
+            print("Thank you for using BeWhoop Support!")
             break
-        resp = agent_executor.invoke({"input": question, "tools": tools})
-        print(resp['output'])
+        
+        if not question:
+            continue
+            
+        try:
+            resp = agent_executor.invoke({"input": question})
+            output = resp['output']
+            print(f"\nBeWhoop Assistant: {output}")
+            
+            # Check if escalation is needed - only escalate if no answer found in KB
+            if ("couldn't find an answer" in output.lower() and 
+                "escalate" in output.lower() and 
+                "contact number" in output.lower() and 
+                "email" in output.lower()):
+                if handle_escalation(question):
+                    break
+                
+        except Exception as e:
+            print(f"\nError: {e}")
+            print("Please try again or contact support directly.")
+
+if __name__ == "__main__":
+    main()
