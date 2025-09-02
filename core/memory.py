@@ -1,5 +1,11 @@
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import SupabaseVectorStore
 from db.db import supabase_client
+from .models import Answer
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Embeddings
 embeddings = HuggingFaceEmbeddings(
@@ -8,7 +14,16 @@ embeddings = HuggingFaceEmbeddings(
     encode_kwargs={"normalize_embeddings": True}
 )
 
-def semantic_memory_lookup(query: str, threshold: float = 0.82):
+# Vector store
+vector_store = SupabaseVectorStore(
+    embedding=embeddings,
+    client=supabase_client,
+    table_name="documents",
+    query_name="match_documents",
+)
+
+def semantic_memory_lookup(query: str, threshold: float = 0.82) -> Answer:
+    """Search for previously answered questions in semantic memory"""
     # Turning query to vector for semantic search
     query_vec = embeddings.embed_query(query)
     # Searching
@@ -17,9 +32,39 @@ def semantic_memory_lookup(query: str, threshold: float = 0.82):
         {"query_embedding": query_vec, "match_threshold": threshold, "match_count": 1}
     ).execute()
     data = getattr(response, "data", None) or []
-    return data[0] if data else None
+    
+    if data and len(data) > 0:
+        result = data[0]
+        # Validate the answer quality
+        answer = result.get('answer', '').strip()
+        if (answer and 
+            len(answer) > 20 ):
+            return Answer(found=True, chunks=[result])
+    
+    return Answer(found=False, chunks=[])
+
+def search_knowledge_base_internal(query: str) -> Answer:
+    """Search the knowledge base and return raw chunks - no LLM processing"""
+    try:
+        # Fetching chunks
+        relevant_docs = vector_store.similarity_search(query, k=3)
+        if not relevant_docs:
+            return Answer(found=False, chunks=[])
+        
+        # Check if documents contain meaningful content
+        doc_content = " ".join([doc.page_content for doc in relevant_docs])
+        if len(doc_content.strip()) < 400:
+            return Answer(found=False, chunks=[])
+        
+        # Return raw chunks - let the main LLM process them
+        return Answer(found=True, chunks=relevant_docs)
+        
+    except Exception as e:
+        print(f"Error in knowledge base search: {e}")
+        return Answer(found=False, chunks=[])
 
 def semantic_memory_upsert(question: str, answer: str):
+    """Store question-answer pair in semantic memory"""
     # Converting Query to vectors
     q_vec = embeddings.embed_query(question)
     # Making payload as json, because upsert accepts json

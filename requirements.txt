@@ -6,3 +6,5 @@ langchain-openai
 transformers 
 sentence-transformers
 langchain_huggingface
+langgraph
+langchain-google-genai

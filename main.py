@@ -1,89 +1,233 @@
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from core import tools, create_support_ticket
 import os
 from dotenv import load_dotenv
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+from core import (
+    ConversationState, 
+    query_tools_parallel, 
+    process_tool_results, 
+    handle_escalation_flow,
+    semantic_memory_upsert
+)
 
 load_dotenv()
 
-# LLM for the agent
-llm = ChatOpenAI(
-    model_name="openai/gpt-3.5-turbo",
-    base_url="https://openrouter.ai/api/v1",
-    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+# Global state - much simpler than a class
+conversation_state = ConversationState()
+MAX_CLARIFICATION_ATTEMPTS = 1
+
+# LLM for answering
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash-lite",
+    google_api_key=os.getenv("GEMINI_API_KEY"),
     temperature=0.2,
-    max_tokens=500,
+    max_output_tokens=500,
 )
 
-# Agent prompt
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are BeWhoop's Support AI assistant. You help customers with questions about our services.
+def answer_with_llm(question: str, context: str) -> str:
+    """Use LLM to answer question with context - returns CANNOT_ANSWER if context is insufficient"""
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a BeWhoop Assistant. BeWhoop is a social platform that connects vendors with event organizers and event seekersq with their favourite genre events, providing services for event seekers, vendor registration, event management, and facility of booking events for event seekers with ease.
 
-Your workflow:
-1. ALWAYS start with search_memory to check for previously answered questions
-2. If memory search finds a relevant answer, return it directly to the user
-3. If no memory result, use search_knowledge_base to search the knowledge base
-4. If knowledge base returns a clear answer, provide it to the user - DO NOT ask for escalation
-5. If knowledge base returns "NO_ANSWER_FOUND_IN_KB", you MUST say: "I couldn't find an answer to your question. I will need to escalate this to our support team. Could you please provide your contact number and email address for further assistance?"
+        Your job:
+        1. If the question is about BeWhoop services/platform OR about who you are/your capabilities - answer it helpfully
+        2. If the question is completely unrelated to BeWhoop (like "who was Albert Einstein", "what's the weather") - politely decline and redirect to BeWhoop topics
+        3. Use the provided context to give detailed, comprehensive answers
+        4. Be conversational and helpful, not robotic
 
-Critical Rules:
-- When you see "NO_ANSWER_FOUND_IN_KB", do NOT ask for more context - escalate immediately
-- If you find relevant information in the knowledge base, provide it without asking for escalation
-- Never hallucinate or invent information
-- Be professional and concise"""),
-    ("user", "{input}"),
-    ("placeholder", "{agent_scratchpad}")
-])
-
-# Create agent
-agent = create_tool_calling_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-def handle_escalation(question):
-    """Handle the escalation process by collecting contact info"""
-    print("\n--- Escalation Process ---")
-    contact_number = input("Please enter your contact number: ").strip()
-    email_address = input("Please enter your email address: ").strip()
+        CRITICAL: Only provide a real answer if the context actually contains SPECIFIC, ACTIONABLE information needed to answer the question. Generic mentions or vague statements are NOT sufficient. If the provided context doesn't contain DETAILED, SPECIFIC information to properly answer the user's question, you MUST respond with exactly: "CANNOT_ANSWER_WITH_CONTEXT"
+        
+        Examples of INSUFFICIENT context:
+        - "you can book events with ease" (too vague, no steps)
+        - "BeWhoop provides booking services" (no how-to details)  
+        - General platform descriptions without specific instructions"""),
+        ("human", "Question: {question}\n\nContext: {context}\n\nPlease respond:")
+        ])
     
-    if contact_number and email_address:
-        result = create_support_ticket(question, contact_number, email_address)
-        print(f"\nBeWhoop Assistant: {result}")
+    chain = prompt | llm
+    response = chain.invoke({"question": question, "context": context})
+    return response.content.strip()
+
+def is_escalation_request(user_input: str) -> bool:
+    """Check if user is specifically requesting escalation"""
+    escalation_keywords = [
+        "escalate", "escalation", "human support", "human agent", 
+        "talk to human", "speak to human", "real person", "live agent", "escalate this",
+        "escalate my issue", "i want to escalate", "need human help"
+    ]
+    
+    user_input_lower = user_input.lower().strip()
+    
+    # Check for direct escalation requests
+    if any(keyword in user_input_lower for keyword in escalation_keywords):
         return True
+    
+    # Check for phrases
+    # if user_input_lower in ["yes escalate", "escalate please", "escalate", "yes, escalate","can you transfer me to human support"]:
+    #     return True
+        
+    return False
+
+
+def ask_for_clarification() -> str:
+    """Ask user for more context based on clarification attempt"""
+    # print(f"DEBUG: Clarification attempt {conversation_state.clarification_attempts}")
+    
+    if conversation_state.clarification_attempts == 1:
+        return ("I couldn't find answer about your question."
+               "Could you please rephrase your question or provide more details about what you're looking for?")
     else:
-        print("\nBeWhoop Assistant: Both contact number and email are required for escalation. Please try again.")
-        return False
+        return ""  # Max attempts reached
+
+def process_user_input(user_input: str, is_clarification: bool = False) -> str:
+    """Unified function to process user input (either new question or clarification)"""
+    global conversation_state
+    
+    # Check if user is specifically requesting escalation
+    if is_escalation_request(user_input):
+        conversation_state.question = user_input.strip()
+        escalated, message = handle_escalation_flow(conversation_state)
+        if escalated:
+            return message
+        else:
+            # User declined escalation, reset for new question
+            reset_conversation()
+            return message
+    
+    # Prepare the question based on whether it's a clarification or new question
+    if is_clarification:
+        # Combine original question with clarification
+        question_to_process = f"{conversation_state.original_question} {user_input}"
+        print(f"DEBUG: handle_clarification called, current attempts: {conversation_state.clarification_attempts}")
+    else:
+        # New question - update state and reset search results
+        question_to_process = user_input.strip()
+        conversation_state.question = question_to_process
+        # Only set original_question if this is a fresh conversation (no clarification attempts yet)
+        if conversation_state.clarification_attempts == 0:
+            conversation_state.original_question = question_to_process
+        conversation_state.reset_search_results()
+    
+    # Query tools in parallel (Memory + KB) - only fetch chunks
+    memory_result, kb_result = query_tools_parallel(question_to_process)
+    
+    # Process results and update state
+    conversation_state = process_tool_results(conversation_state, memory_result, kb_result)
+    
+    debug_prefix = "After clarification - " if is_clarification else ""
+    print(f"DEBUG: {debug_prefix}Memory found: {conversation_state.qa_found}, KB found: {conversation_state.kb_found}")
+    
+    # Check chunks in priority order: Memory → KB → Clarification
+    
+    # First check memory chunks
+    if conversation_state.qa_found and conversation_state.qa_chunks:
+        context = f"From Memory: {conversation_state.qa_chunks[0].get('answer', '')}"
+        answer = answer_with_llm(question_to_process, context)
+        
+        # Check if LLM couldn't answer with the context
+        if answer == "CANNOT_ANSWER_WITH_CONTEXT":
+            debug_msg = "after clarification" if is_clarification else "treating as no results"
+            print(f"DEBUG: LLM couldn't answer with memory context {debug_msg}")
+            return handle_no_results()
+        
+        return answer
+    
+    # Then check KB chunks
+    elif conversation_state.kb_found and conversation_state.kb_chunks:
+        context = f"From Knowledge Base: {' '.join([doc.page_content for doc in conversation_state.kb_chunks])}"
+        answer = answer_with_llm(question_to_process, context)
+        
+        # Check if LLM couldn't answer with the context
+        if answer == "CANNOT_ANSWER_WITH_CONTEXT":
+            debug_msg = "after clarification" if is_clarification else "treating as no results"
+            print(f"DEBUG: LLM couldn't answer with KB context {debug_msg}")
+            return handle_no_results()
+        
+        # Store this Q&A in memory for future use (only if successfully answered)
+        semantic_memory_upsert(question_to_process, answer)
+        return answer
+    
+    # No chunks found - ask for clarification or escalate
+    else:
+        debug_msg = "Still no chunks after clarification" if is_clarification else "No chunks found, going to handle_no_results"
+        print(f"DEBUG: {debug_msg}")
+        return handle_no_results()
+
+def handle_no_results() -> str:
+    """Handle cases where no results were found"""
+    global conversation_state
+    
+    # print(f"DEBUG: handle_no_results called, current attempts: {conversation_state.clarification_attempts}")
+    
+    # Check if we've reached max clarification attempts
+    if conversation_state.clarification_attempts >= MAX_CLARIFICATION_ATTEMPTS:
+        print(f"DEBUG: Max attempts reached, escalating")
+        # Proceed to escalation flow
+        escalated, message = handle_escalation_flow(conversation_state)
+        if escalated:
+            return message
+        else:
+            # User declined escalation, reset for new question
+            reset_conversation()
+            return message
+    
+    # Ask for clarification
+    conversation_state.clarification_attempts += 1
+    print(f"DEBUG: Incremented to attempt {conversation_state.clarification_attempts}")
+    return ask_for_clarification()
+
+
+def reset_conversation():
+    """Reset conversation state for new interaction"""
+    global conversation_state
+    conversation_state = ConversationState()
+
+def is_waiting_for_clarification() -> bool:
+    """Check if we're in a clarification state"""
+    return (conversation_state.clarification_attempts > 0 and 
+            conversation_state.clarification_attempts < MAX_CLARIFICATION_ATTEMPTS and
+            not conversation_state.escalation_needed)
 
 def main():
+    """Main application loop"""
     print("BeWhoop Support Assistant")
+    print("I'm here to help you with BeWhoop-related questions!")
     print("Type 'exit' to quit")
-    print("-" * 30)
+    print("-" * 50)
     
     while True:
-        question = input("\nAsk a question: ").strip()
-        if question.lower() == "exit":
-            print("Thank you for using BeWhoop Support!")
+        # Get user input
+        if is_waiting_for_clarification():
+            user_input = input("\nPlease provide more details: ").strip()
+        else:
+            user_input = input("\nAsk a question: ").strip()
+        
+        # Handle special commands
+        if user_input.lower() == "exit":
+            print("\n👋 Thank you for using BeWhoop Support!")
             break
         
-        if not question:
+        if not user_input:
             continue
-            
+        
         try:
-            resp = agent_executor.invoke({"input": question})
-            output = resp['output']
-            print(f"\nBeWhoop Assistant: {output}")
+            # Process the input
+            if is_waiting_for_clarification():
+                response = process_user_input(user_input, is_clarification=True)
+            else:
+                response = process_user_input(user_input)
             
-            # Check if escalation is needed - only escalate if no answer found in KB
-            if ("couldn't find an answer" in output.lower() and 
-                "escalate" in output.lower() and 
-                "contact number" in output.lower() and 
-                "email" in output.lower()):
-                if handle_escalation(question):
-                    break
+            print(f"\n🤖 BeWhoop Assistant: {response}")
+            
+            # If escalation was completed, reset for next conversation
+            if conversation_state.escalation_needed:
+                reset_conversation()
+                print("\n" + "="*50)
+                print("Ready for your next question!")
                 
         except Exception as e:
-            print(f"\nError: {e}")
-            print("Please try again or contact support directly.")
+            print(f"\n❌ Error: {e}")
+            print("Please try again or type 'reset' to start over.")
 
 if __name__ == "__main__":
     main()
