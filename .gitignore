@@ -2,3 +2,5 @@
 venv/
 __pycache__
 demo.py
+test_intelligent_routing.py
+quick_test.py
