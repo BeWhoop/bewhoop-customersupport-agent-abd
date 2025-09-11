@@ -35,7 +35,7 @@ def main():
         
         # Handle special commands
         if user_input.lower() == "exit":
-            print("\n👋 Thank you for using BeWhoop Support!")
+            print("\n👋 Thank you for using BeWhoop Support! !!!")
             break
         
         if not user_input:
